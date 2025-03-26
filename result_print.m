@@ -4,7 +4,7 @@ clc;
 curve_num = 3;
 
 % 定义文件路径（注意MATLAB中使用正斜杠或双反斜杠）
-file_path1 = 'D:\GNNresults\20250326_2\k_results_kmin_1_kmax_6_2k_time.txt';
+file_path1 = 'D:\GNN\results\20250326_2\k_results_kmin_1_kmax_6_2k_time.txt';
 if curve_num >= 2
     file_path2 = 'D:\GNN\results\20250326_2\k_results_kmin_1_kmax_6_2k_pos.txt';
 end
