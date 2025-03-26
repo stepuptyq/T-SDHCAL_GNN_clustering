@@ -4,7 +4,7 @@ This repository contains code for processing particle collision data and trainin
 
 ## Main Components
 
-### 1. Data Processing (`process_particle_data.py`)
+### 1. Data Processing (`time_filtering.py`)
 Key features:
 - Filters particle events using IQR-based outlier detection
 - Performs data standardization:
@@ -12,7 +12,7 @@ Key features:
   - Time values normalized by 5
 - Handles grouped particle events using event indices
 
-### 2. GNN Training (`gnn_training.py`)
+### 2. GNN Training (`clustering_gnn.py`)
 Key components:
 - Graph construction using k-NN with 3 modes:
   1. Time-based adjacency
