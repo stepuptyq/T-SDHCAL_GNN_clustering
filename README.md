@@ -1,6 +1,6 @@
 # Particle Identification using Graph Neural Networks
 
-This repository contains code for processing particle collision data and training a Graph Neural Network (GNN) model for particle identification tasks.
+This repository implements a particle identification pipeline featuring collision data processing and Graph Neural Network (GNN) training modules, with complementary MATLAB visualization scripts for rapid result analysis.
 
 ## Main Components
 
