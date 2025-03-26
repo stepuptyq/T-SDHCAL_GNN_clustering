@@ -235,7 +235,7 @@ for mode in range(1, 4):            # 1 for time; 2 for position; 3 for both. Fo
             pbar_outer.update(1)
             index_i += 1
 
-    save_dir = "D:\\GNN\\GNN_4070\\PhysicNN\\results\\" + date
+    save_dir = "D:\\GNN\\results\\" + date
     if mode == 1:
         file_name = f"k_results_kmin_{k_min}_kmax_{k_max}_{data_num_str}_time.txt"
     elif mode == 2:
