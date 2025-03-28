@@ -16,7 +16,7 @@ config = {
     'date': '20250328',
     'data_num': '20k',
     'knn_k': 8,
-    'mode': 'time',        # route, time
+    'mode': 'route',        # route, time
     'time_window': 2.0,  # ns
     'hidden_dim': 256,
     'batch_size': 64,
@@ -273,8 +273,8 @@ def process_dataset(df, preprocessor):
 def main():
     # 数据准备
     global raw_datasets  # 用于create_pyg_data判断训练集
-    pion_route = f"D:\\GNN\\simulate_data\\transfer_9435897_files_031472cb\\{config['data_num']}pi-_Emin1Emax100_digitized_hits_continuous_merged_time_filtered.csv"
-    proton_route = f"D:\\GNN\\simulate_data\\transfer_9435897_files_031472cb\\{config['data_num']}proton_Emin1Emax100_digitized_hits_continuous_merged_time_filtered.csv"
+    pion_route = f"D:\\GNN\\simulate_data\\transfer_9435897_files_031472cb\\{config['data_num']}pi-_Emin1Emax100_digitized_hits_continuous_merged.csv"
+    proton_route = f"D:\\GNN\\simulate_data\\transfer_9435897_files_031472cb\\{config['data_num']}proton_Emin1Emax100_digitized_hits_continuous_mergedd.csv"
     raw_datasets = load_and_split_data(pion_route, proton_route)
 
     # 仅在训练集上创建并拟合预处理器
