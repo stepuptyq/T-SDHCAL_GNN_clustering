@@ -1,250 +1,389 @@
 import torch
-import pandas as pd
 import numpy as np
+import pandas as pd
+from torch import nn
 from torch_geometric.data import Data, DataLoader
-from torch_geometric.nn import GCNConv, global_mean_pool
-import torch.nn.functional as F
+from torch_geometric.nn import GATConv, TAGConv, GraphConv, GraphNorm, global_max_pool, global_mean_pool
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import RobustScaler, QuantileTransformer
+from sklearn.metrics import accuracy_score, roc_auc_score, confusion_matrix
+import matplotlib.pyplot as plt
 from tqdm import tqdm
 import os
 
-# 设备配置
-# Device configuration (GPU/CPU setup)
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+# 超参数配置
+config = {
+    'date': '20250328',
+    'data_num': '20k',
+    'knn_k': 8,
+    'mode': 'time',        # route, time
+    'time_window': 2.0,  # ns
+    'hidden_dim': 256,
+    'batch_size': 64,
+    'lr': 3e-4,
+    'epochs': 100,
+    'layer_z_bins': 10
+}
 
-# 数据加载和预处理函数
-# Data loading and preprocessing functions
-def load_data(file_path, label, k, mode, if_norm):
-    column_names = [
-        'event_index',
-        'x_coords', 
-        'y_coords',
-        'z_coords',
-        'time'
-    ]
-    
-    df = pd.read_csv(file_path, header=0, names=column_names)
-    
-    numeric_cols = ['x_coords', 'y_coords', 'z_coords', 'time']
-    df[numeric_cols] = df[numeric_cols].apply(pd.to_numeric, errors='coerce')
-    
-    df = df.dropna(subset=numeric_cols)
-    
-    # 数据归一化
-    # Data normalization
-    # 空间坐标列
-    # Spatial coordinates columns
-    space_cols = ['x_coords', 'y_coords', 'z_coords']
-    # 时间列
-    # time_col = 'time'
+def knn_z(features, k, mode):
+    if mode == 'route':
+        coords = features[:, :3].to('cuda')
+        z = coords[:, 2]
 
-    if if_norm:
-        # 对空间坐标进行标准化
-        # Normalize spatial coordinates
-        scaler = StandardScaler()
-        df[space_cols] = scaler.fit_transform(df[space_cols])
+        # 创建z坐标比较掩码 [N, N]  generate z-coord mask by comparison
+        mask = z.view(-1, 1) > z.view(1, -1)
 
-        # 对时间进行单独处理
-        # df[time_col] = df[time_col] / 3
+        # 计算所有点对的平方距离 [N, N]     calculate square distance between all poles
+        diff = coords.unsqueeze(1) - coords.unsqueeze(0)  # 形状 [N, N, 3]
+        dist_sq = (diff ** 2).sum(dim=-1)  # 形状 [N, N]
+
+        # 将不满足条件的距离设为无穷大      set the distances that fail to meet the condition to inf
+        inf = torch.tensor(float('inf'), device=dist_sq.device)
+        dist_sq_masked = torch.where(mask, dist_sq, inf)
+
+        # 找到每个点的最近邻索引        find nearest indices for each pole
+        min_dist_sq, min_indices = torch.min(dist_sq_masked, dim=1)
+
+        # 过滤无效的边（无候选点的情况）    fileter out the invalid edges
+        valid_mask = min_dist_sq != float('inf')
+        sources = torch.where(valid_mask)[0]
+        targets = min_indices[valid_mask]
+    elif mode == 'time':
+        z = features[:, 3].to('cuda')
+
+        # 创建z坐标比较掩码 [N, N]  create the time comparison masks
+        mask = z.view(-1, 1) > z.view(1, -1)
+
+        # 计算所有点对的平方距离 [N, N]     calculate the square time distances between all poles
+        diff = z.unsqueeze(1) - z.unsqueeze(0)  # # 形状 [N, N]
+        dist_sq = diff ** 2  # 形状 [N, N]
+
+        # 将不满足条件的距离设为无穷大      set the distances that fail to meet the condition to inf
+        inf = torch.tensor(float('inf'), device=dist_sq.device)
+        dist_sq_masked = torch.where(mask, dist_sq, inf)
+
+        # 找到每个点的最近邻索引        find nearest indices for each pole
+        min_dist_sq, min_indices = torch.min(dist_sq_masked, dim=1)
+
+        # 过滤无效的边（无候选点的情况）    fileter out the invalid edges
+        valid_mask = min_dist_sq != float('inf')
+        sources = torch.where(valid_mask)[0]
+        targets = min_indices[valid_mask]
+
+    # 构建边索引矩阵    produce edge index
+    edge_index = torch.stack([sources, targets])
+    return edge_index.cpu()
+
+
+def load_and_split_data(pion_path, proton_path, test_size=0.2, val_size=0.1):
+    """加载数据并进行事件级别的分层划分 load the data and slice them according to event_index"""
+    pion_df = pd.read_csv(pion_path).assign(label=0, event_id=lambda x: x['event_index'].astype(str)+'_pion')
+    proton_df = pd.read_csv(proton_path).assign(label=1, event_id=lambda x: x['event_index'].astype(str)+'_proton')
+    full_df = pd.concat([pion_df, proton_df]).reset_index(drop=True)
     
-    data_list = []
+    # 获取唯一事件ID及对应标签  get unique event ID and label
+    event_labels = full_df.groupby('event_id')['label'].first()
+    event_ids = event_labels.index.values
+    labels = event_labels.values
     
-    for particle_id, group in df.groupby('event_index'):
-        features = group[numeric_cols].values.astype(np.float32)
+    # 分层划分      split into train, val, test
+    train_events, test_events = train_test_split(
+        event_ids, test_size=test_size, stratify=labels, random_state=42
+    )
+    train_events, val_events = train_test_split(
+        train_events, 
+        test_size=val_size/(1-test_size), 
+        stratify=event_labels.loc[train_events], 
+        random_state=42
+    )
+    
+    # 构建数据集    construct dataset
+    return {
+        'train': full_df[full_df['event_id'].isin(train_events)],
+        'val': full_df[full_df['event_id'].isin(val_events)],
+        'test': full_df[full_df['event_id'].isin(test_events)]
+    }
+
+# 2. 数据预处理管道
+class GraphPreprocessor:
+    def __init__(self):
+        self.spatial_scaler = None
+        self.time_scaler = None
+        self.layer_scalers = {}
+        self.z_bins = None
+
+    def fit(self, graphs):
+        """基于训练数据拟合预处理参数 fit parameters of the preprocessor using only train data"""
+        all_coords = []
+        all_time = []
+        all_z = []
         
-        if len(features) < 2:
-            continue
-            
-        x = torch.tensor(features, dtype=torch.float32)
+        for g in graphs:
+            all_coords.append(g['x'][:, :3])
+            all_time.append(g['x'][:, 3])
+            all_z.append(g['z_coords'])
         
-        edge_index = manual_knn(features[:, :], k, mode)
+        # 空间坐标归一化    position normalization
+        self.spatial_scaler = RobustScaler().fit(np.vstack(all_coords))
+        # 时间分位数归一化      time normalization
+        self.time_scaler = QuantileTransformer(output_distribution='normal').fit(np.hstack(all_time).reshape(-1,1))
+        # 分层z归一化       layer z normalization
+        z_all = np.hstack(all_z)
+        self.z_bins = np.linspace(z_all.min(), z_all.max(), config['layer_z_bins']+1)
         
-        data = Data(
-            x=x.to(device),
-            edge_index=edge_index.to(device),
-            y=torch.tensor([label], dtype=torch.long).to(device)
+        for bin_idx in range(config['layer_z_bins']):
+            mask = (z_all >= self.z_bins[bin_idx]) & (z_all < self.z_bins[bin_idx+1])
+            if mask.sum() > 0:
+                self.layer_scalers[bin_idx] = RobustScaler().fit(z_all[mask].reshape(-1,1))
+
+    def transform(self, graph):
+        """应用预处理到单个图 apply preprocessor to each graph"""
+        # 空间坐标      position
+        spatial = self.spatial_scaler.transform(graph['x'][:, :3])
+        # 时间      time
+        time = self.time_scaler.transform(graph['x'][:, 3].reshape(-1,1))
+        # 分层z     z layer process
+        z = graph['z_coords'].copy()
+        for bin_idx in range(config['layer_z_bins']):
+            mask = (z >= self.z_bins[bin_idx]) & (z < self.z_bins[bin_idx+1])
+            if mask.sum() > 0 and bin_idx in self.layer_scalers:
+                z[mask] = self.layer_scalers[bin_idx].transform(z[mask].reshape(-1,1)).flatten()
+        # 能量等级one-hot       using one-hot to process threshold data
+        thr = graph['x'][:, -1].astype(int)
+        thr_onehot = np.eye(3)[thr-1]  # thr取值为1,2,3     thr=[1,3]
+        
+        return np.hstack([spatial, time, z.reshape(-1,1), thr_onehot]).astype(np.float32)
+
+# 3. 图结构构建
+def build_graph(features, time, k=8, mode='route', time_window=2.0):
+    """构建带时间约束的KNN图结构"""
+    edge_features = torch.tensor(features[:, :], dtype=torch.float)
+    edge_index = knn_z(edge_features, k, mode)
+    
+    # 时间一致性过滤        filter by time window
+    src_time = time[edge_index[0]]
+    dst_time = time[edge_index[1]]
+    time_mask = (torch.abs(src_time - dst_time) < time_window).numpy()
+    
+    return edge_index[:, time_mask]
+
+def create_pyg_data(raw_df):
+    """从DataFrame创建PyG数据集"""
+    preprocessor = GraphPreprocessor()
+    
+    # 原始图数据生成        raw graph generation
+    raw_graphs = []
+    for event_id, group in raw_df.groupby('event_id'):
+        coords = group[['x_coords', 'y_coords', 'z_coords']].values
+        time = group['time'].values.reshape(-1,1)
+        thr = group['thr'].values
+        
+        raw_graphs.append({
+            'x': np.hstack([coords, time, thr.reshape(-1,1)]).astype(np.float32),
+            'y': group['label'].iloc[0],
+            'z_coords': coords[:,2]
+        })
+    
+    # 仅在训练集上拟合预处理器      only fit the preprocessor on train data
+    if raw_df is raw_datasets['train']:
+        preprocessor.fit(raw_graphs)
+    
+    # 转换所有图数据    convert all graph data
+    processed_graphs = []
+    for raw in tqdm(raw_graphs):
+        features = preprocessor.transform(raw)
+        edge_index = build_graph(
+            features=features,
+            time=torch.tensor(raw['x'][:,3]),
+            k=config['knn_k'],
+            mode=config['mode'],
+            time_window=config['time_window']
         )
-        data_list.append(data)
+        processed_graphs.append(Data(
+            x=torch.tensor(features),
+            edge_index=edge_index,
+            y=torch.tensor([raw['y']], dtype=torch.long),
+            num_nodes=len(features)
+        ))
     
-    return data_list
+    return processed_graphs
 
-def manual_knn(pos, k, mode):
-    pos = torch.tensor(pos, dtype=torch.float32)
-    num_points = pos.size(0)
-    k = min(k, num_points - 1)
-    if k < 1:
-        return torch.zeros((2, 0), dtype=torch.long)  # 返回标准形状的空边  Return empty edges in standard shape
-
-    def get_edges(feature):
-        dist = torch.cdist(feature, feature)
-        _, indices = torch.topk(dist, k=k+1, dim=1, largest=False)
-        rows = torch.arange(pos.size(0)).view(-1,1).repeat(1, k+1).flatten()
-        cols = indices.flatten()
-        mask = rows != cols
-        edges = torch.stack([rows[mask], cols[mask]], dim=0)
-        return edges.unique(dim=1)  # 去重确保边唯一  Remove duplicates to ensure edge uniqueness
-
-    if mode == 1:
-        time_feat = pos[:, -1].reshape(-1, 1)
-        edges = get_edges(time_feat)
-    elif mode == 2:
-        edges = get_edges(pos)
-    elif mode == 3:
-        time_edges = get_edges(pos[:, -1].reshape(-1, 1))
-        space_edges = get_edges(pos)
-        set_time = {tuple(e) for e in time_edges.t().cpu().numpy()}
-        set_space = {tuple(e) for e in space_edges.t().cpu().numpy()}
-        intersection = set_time & set_space
-        if not intersection:
-            return torch.zeros((2, 0), dtype=torch.long)
-        edges = torch.tensor(list(intersection)).t()
-    else:
-        raise ValueError("Invalid mode")
-
-    return edges if edges.numel() > 0 else torch.zeros((2, 0), dtype=torch.long)
-
-# 定义GNN模型
-# Define GNN model
-class ParticleGNN(torch.nn.Module):
-    def __init__(self, hidden_channels=128):
+# 4. GNN模型 GNN model
+class ParticleGNN(nn.Module):
+    def __init__(self, input_dim=8, hidden=256):
         super().__init__()
-        self.conv1 = GCNConv(4, hidden_channels)
-        self.conv2 = GCNConv(hidden_channels, hidden_channels)
-        self.conv3 = GCNConv(hidden_channels, hidden_channels)
-        self.lin = torch.nn.Linear(hidden_channels, 2)
-        
-    def forward(self, x, edge_index, batch):
-        # 1. 进行图卷积
-        # Perform graph convolution
-        x = self.conv1(x, edge_index).relu()
-        x = self.conv2(x, edge_index).relu()
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, hidden),
+            nn.GELU()
+        )
+        self.conv1 = GATConv(hidden, hidden//4, heads=4)
+        self.conv2 = TAGConv(hidden, hidden)
+        self.conv3 = GraphConv(hidden, hidden)
+        self.norm1 = GraphNorm(hidden)
+        self.norm2 = GraphNorm(hidden)
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden*2, hidden),
+            nn.Dropout(0.3),
+            nn.GELU(),
+            nn.Linear(hidden, 2)
+        )
+
+    def forward(self, data):
+        x, edge_index, batch = data.x, data.edge_index, data.batch
+        x = self.encoder(x)
+        x = self.conv1(x, edge_index)
+        x = self.norm1(x, batch).relu()
+        x = self.conv2(x, edge_index)
+        x = self.norm2(x, batch).relu()
         x = self.conv3(x, edge_index).relu()
+        x_max = global_max_pool(x, batch)
+        x_mean = global_mean_pool(x, batch)
+        x_pool = torch.cat([x_max, x_mean], dim=1)
+        return self.classifier(x_pool).log_softmax(dim=-1)
+    
+def process_dataset(df, preprocessor):
+    graphs = []
+    for event_id, group in df.groupby('event_id'):
+        coords = group[['x_coords', 'y_coords', 'z_coords']].values
+        time = group['time'].values.reshape(-1,1)
+        thr = group['thr'].values
         
-        # 2. 全局池化
-        # Global pooling
-        x = global_mean_pool(x, batch)
+        raw_graph = {
+            'x': np.hstack([coords, time, thr.reshape(-1,1)]).astype(np.float32),
+            'y': group['label'].iloc[0],
+            'z_coords': coords[:,2]
+        }
         
-        # 3. 分类层
-        # Classification layer
-        x = self.lin(x)
-        return F.log_softmax(x, dim=1)
+        features = preprocessor.transform(raw_graph)
+        edge_index = build_graph(
+            features=features,
+            time=torch.tensor(raw_graph['x'][:,3]),
+            k=config['knn_k'],
+            time_window=config['time_window']
+        )
+        graphs.append(Data(
+            x=torch.tensor(features),
+            edge_index=edge_index,
+            y=torch.tensor([raw_graph['y']], dtype=torch.long),
+            num_nodes=len(features)
+        ))
+    return graphs
 
-model = ParticleGNN(hidden_channels=128).to(device)
-optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
-criterion = torch.nn.CrossEntropyLoss()
+# 5. 训练流程
+def main():
+    # 数据准备
+    global raw_datasets  # 用于create_pyg_data判断训练集
+    pion_route = f"D:\\GNN\\simulate_data\\transfer_9435897_files_031472cb\\{config['data_num']}pi-_Emin1Emax100_digitized_hits_continuous_merged_time_filtered.csv"
+    proton_route = f"D:\\GNN\\simulate_data\\transfer_9435897_files_031472cb\\{config['data_num']}proton_Emin1Emax100_digitized_hits_continuous_merged_time_filtered.csv"
+    raw_datasets = load_and_split_data(pion_route, proton_route)
 
-# 训练函数
-# Training function
-def train():
-    model.train()
-    total_loss = 0
-    for data in train_loader:
-        data = data.to(device)
-        optimizer.zero_grad()
-        out = model(data.x, data.edge_index, data.batch)
-        loss = criterion(out, data.y)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item() * data.num_graphs
-    return total_loss / len(train_loader.dataset)
-
-# 测试函数
-# Testing function
-def test(loader):
-    model.eval()
-    correct = 0
-    for data in loader:
-        data = data.to(device)
+    # 仅在训练集上创建并拟合预处理器
+    train_preprocessor = GraphPreprocessor()
+    train_graphs = []
+    
+    # 处理训练集
+    for event_id, group in raw_datasets['train'].groupby('event_id'):
+        coords = group[['x_coords', 'y_coords', 'z_coords']].values
+        time = group['time'].values.reshape(-1,1)
+        thr = group['thr'].values
+        train_graphs.append({
+            'x': np.hstack([coords, time, thr.reshape(-1,1)]).astype(np.float32),
+            'y': group['label'].iloc[0],
+            'z_coords': coords[:,2]
+        })
+    train_preprocessor.fit(train_graphs)  # 关键点：只在训练集上拟合
+    
+    # 创建所有数据集
+    train_data = process_dataset(raw_datasets['train'], train_preprocessor)
+    val_data = process_dataset(raw_datasets['val'], train_preprocessor)  # 使用训练集的预处理器
+    test_data = process_dataset(raw_datasets['test'], train_preprocessor)  # 使用训练集的预处理器
+    
+    # 创建DataLoader
+    train_loader = DataLoader(train_data, batch_size=config['batch_size'], shuffle=True)
+    val_loader = DataLoader(val_data, batch_size=config['batch_size'])
+    test_loader = DataLoader(test_data, batch_size=config['batch_size'])
+    
+    # 模型训练
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = ParticleGNN(hidden=config['hidden_dim']).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config['lr'])
+    
+    best_val_auc = 0
+    patience = 30
+    for epoch in range(config['epochs']):
+        # 训练阶段
+        model.train()
+        for batch in train_loader:
+            batch = batch.to(device)
+            optimizer.zero_grad()
+            loss = nn.functional.nll_loss(model(batch), batch.y)
+            loss.backward()
+            optimizer.step()
+        
+        # 验证阶段
+        model.eval()
+        val_preds, val_labels = [], []
         with torch.no_grad():
-            pred = model(data.x, data.edge_index, data.batch).argmax(dim=1)
-            correct += (pred == data.y).sum().item()
-    return correct / len(loader.dataset)
-
-# 循环
-# Loop
-k_min = 1
-k_max = 6
-loop_time = 10
-test_acc = np.zeros((loop_time, k_max - k_min + 1))
-train_num = 500
-date = "20250326_2"
-random_state = 40
-if_norm = 1
-for mode in range(1, 4):            # 1 for time; 2 for position; 3 for both. For knn generation
-    index_i = 0
-    data_num_str = '2k'
-    with tqdm(total=k_max - k_min + 1, desc="k_loop") as pbar_outer:
-        for k in range(k_min, k_max + 1):
-
-            # 加载数据集
-            # Load the dataset
-            file_route = 'D:\\GNN\\simulate_data\\transfer_9435897_files_031472cb'
-            proton_data = load_data(file_route + f'\\{data_num_str}proton_Emin1Emax100_digitized_hits_continuous_merged_time_filtered.csv', label=0, k=k, mode=mode, if_norm=if_norm)
-            pion_data = load_data(file_route + f'\\{data_num_str}pi-_Emin1Emax100_digitized_hits_continuous_merged_time_filtered.csv', label=1, k=k, mode=mode, if_norm=if_norm)
-            dataset = proton_data + pion_data
-
-            index_j = 0
-            for j in range(loop_time):
-                # 重置模型参数（关键）
-                # Reset model parameters (critical)
-                model.apply(lambda layer: layer.reset_parameters() if hasattr(layer, 'reset_parameters') else None)
-
-                # 合并并分割数据集
-                # Merge and split dataset
-                train_data, test_data = train_test_split(dataset, test_size=0.2, random_state=random_state + j)
-                val_data, test_data = train_test_split(test_data, test_size=0.5, random_state=random_state + j)
-
-                # 创建数据加载器
-                # Create data loader
-                train_loader = DataLoader(train_data, batch_size=64, shuffle=True)
-                val_loader = DataLoader(val_data, batch_size=64)
-                test_loader = DataLoader(test_data, batch_size=64)
-
-                # 训练循环
-                # Training loop
-                best_val_acc = 0
-                patience = 50
-                with tqdm(total=train_num, desc=f"k: {k}") as pbar_inner:
-                    for epoch in range(train_num):
-                        loss = train()
-                        train_acc = test(train_loader)
-                        val_acc = test(val_loader)
-                        
-                        if val_acc > best_val_acc:
-                            best_val_acc = val_acc
-                            torch.save(model.state_dict(), 'best_model.pth')
-                            counter = 0
-                        else:
-                            counter += 1
-                            if counter >= patience:
-                                break
-                        print(f'Epoch: {epoch:03d}, Loss: {loss:.4f}, '
-                            f'Train Acc: {train_acc:.4f}, Val Acc: {val_acc:.4f}')
-                        pbar_inner.update(1)
-                # 最终测试
-                # Final testing
-                model.load_state_dict(torch.load('best_model.pth', weights_only=True))
-                test_acc[index_j, index_i] = test(test_loader)
-                print(f'\nFinal Test Accuracy: {test_acc[index_j, index_i]:.4f}')
-                index_j += 1
-                # 清理GPU缓存
-                # Clear GPU cache
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-            pbar_outer.update(1)
-            index_i += 1
-
-    save_dir = "D:\\GNN\\results\\" + date
-    if mode == 1:
-        file_name = f"k_results_kmin_{k_min}_kmax_{k_max}_{data_num_str}_time.txt"
-    elif mode == 2:
-        file_name = f"k_results_kmin_{k_min}_kmax_{k_max}_{data_num_str}_pos.txt"
-    elif mode == 3:
-        file_name = f"k_results_kmin_{k_min}_kmax_{k_max}_{data_num_str}_both.txt"
+            for batch in val_loader:
+                batch = batch.to(device)
+                probs = model(batch).exp()[:,1].cpu().numpy()
+                val_preds.extend(probs)
+                val_labels.extend(batch.y.cpu().numpy())
+        
+        val_auc = roc_auc_score(val_labels, val_preds)
+        print(f'Epoch {epoch+1}/{config["epochs"]} | Val AUC: {val_auc:.4f}')
+        
+        if val_auc > best_val_auc:
+            best_val_auc = val_auc
+            torch.save(model.state_dict(), 'best_model.pth')
+            counter = 0
+        else:
+            counter += 1
+            if counter >= patience:
+                break
+    
+    # 测试评估
+    model.load_state_dict(torch.load('best_model.pth'))
+    test_preds, test_labels = [], []
+    with torch.no_grad():
+        for batch in test_loader:
+            batch = batch.to(device)
+            probs = model(batch).exp()[:,1].cpu().numpy()
+            test_preds.extend(probs)
+            test_labels.extend(batch.y.cpu().numpy())
+    
+    print(f'\nTest Results:')
+    print(f'AUC: {roc_auc_score(test_labels, test_preds):.4f}')
+    print(f'Accuracy: {accuracy_score(test_labels, np.round(test_preds)):.4f}')
+    
+    # 可视化
+    plt.figure(figsize=(12,5))
+    plt.subplot(121)
+    plt.hist([p for p,l in zip(test_preds, test_labels) if l==0], 
+             bins=50, alpha=0.5, label='Pion')
+    plt.hist([p for p,l in zip(test_preds, test_labels) if l==1], 
+             bins=50, alpha=0.5, label='Proton')
+    plt.xlabel('Proton Probability'), plt.legend()
+    
+    plt.subplot(122)
+    cm = confusion_matrix(test_labels, np.round(test_preds))
+    plt.imshow(cm, cmap='Blues', interpolation='nearest')
+    plt.colorbar()
+    for i in range(2):
+        for j in range(2):
+            plt.text(j, i, f'{cm[i,j]}', ha='center', va='center')
+    plt.xticks([0,1], ['Pion', 'Proton'])
+    plt.yticks([0,1], ['Pion', 'Proton'])
+    plt.title('Confusion Matrix')
+    
+    plt.tight_layout()
+    plt.savefig(f"D:\\GNN\\results\\{config['data_num']}_{config['mode']}_performance.png")
+    plt.close()
 
     # 确保目标目录存在
     # Ensure target directory exists
+    save_dir = f"D:\\GNN\\results\\{config['date']}"
+    file_name = f"k_results_{config['data_num']}_{config['mode']}.txt"
     os.makedirs(save_dir, exist_ok=True)  # 自动创建目录（如果不存在）  Automatically create directory (if it doesn't exist)
 
     # 拼接完整的文件路径
@@ -255,7 +394,10 @@ for mode in range(1, 4):            # 1 for time; 2 for position; 3 for both. Fo
     # Save matrix as txt file
     np.savetxt(
         fname=full_path,  # 文件路径  File path
-        X=test_acc,         # 要保存的矩阵  Matrix to save
+        X=[roc_auc_score(test_labels, test_preds), accuracy_score(test_labels, np.round(test_preds))],         # 要保存的矩阵  Matrix to save
         fmt="%f",
         delimiter=","     # 分隔符（可选，默认是空格）  Delimiter (optional, default is space)
     )
+
+if __name__ == '__main__':
+    main()
